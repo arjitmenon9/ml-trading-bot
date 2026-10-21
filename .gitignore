@@ -1,0 +1,16 @@
+# Never commit real broker credentials
+fyers_secrets.json
+
+# Old pre-ML backup that has a hardcoded (expired) Fyers access token in it -
+# keep it locally for reference, never push it
+bot_original_rule_based.py.bak
+*.bak
+
+# Local environment / cache
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Noisy local run logs - not useful as code history
+*.log
