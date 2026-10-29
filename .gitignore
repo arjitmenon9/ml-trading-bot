@@ -12,7 +12,8 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# Noisy local run logs - not useful as code history
+# Run logs (scripts write them to logs/) - not useful as code history
+logs/
 *.log
 
 # Personal paper/live trade journal and local settings
