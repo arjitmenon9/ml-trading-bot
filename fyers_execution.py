@@ -39,13 +39,26 @@ paper-mode logs before you ever risk money)
 - MAX_TRADES_PER_DAY: a runaway-bug safety net (e.g. a bug that flips
   signals back and forth every tick) - stops trading once tripped.
 """
+from __future__ import annotations
 import datetime
 
 LIVE_TRADING = False  # <-- the real on/off switch. See the docstring above.
 
 MAX_POSITION_VALUE = 5000     # rupees per trade (only matters if LIVE_TRADING)
-DAILY_LOSS_LIMIT = 2000       # rupees; kill-switch trips below -this
+DAILY_LOSS_LIMIT = 2000       # rupees; kill-switch trips below -this (LIVE)
 MAX_TRADES_PER_DAY = 40       # runaway-bug safety net
+
+# Paper-trading size. The model was back-tested at Rs 50,000 per trade
+# because Fyers' flat charges (Rs 20 brokerage per order + Rs 14.75 DP fee
+# per sell) eat ~1.3% of a Rs 5,000 trade but only ~0.45% of Rs 50,000.
+# Paper mode uses this size so its P&L matches the backtest. Before going
+# live, read the "position size" note in ML_WALKTHROUGH.md.
+PAPER_POSITION_VALUE = 50000
+PAPER_DAILY_LOSS_LIMIT = 25000
+
+# Swing trades are held for days, so orders are delivery (CNC). INTRADAY
+# (MIS) positions would be force-closed by Fyers at ~3:15 PM the same day.
+PRODUCT_TYPE = "CNC"
 
 
 class RiskManager:
@@ -74,10 +87,11 @@ class RiskManager:
         self._check_halt()
 
     def _check_halt(self):
-        if self.realized_pnl_today <= -abs(DAILY_LOSS_LIMIT):
+        limit = DAILY_LOSS_LIMIT if LIVE_TRADING else PAPER_DAILY_LOSS_LIMIT
+        if self.realized_pnl_today <= -abs(limit):
             self.halted = True
             self.halt_reason = (f"Daily loss limit hit: Rs.{self.realized_pnl_today:.2f} "
-                                 f"<= -Rs.{DAILY_LOSS_LIMIT}")
+                                 f"<= -Rs.{limit}")
         elif self.trades_today >= MAX_TRADES_PER_DAY:
             self.halted = True
             self.halt_reason = f"Max trades per day reached ({MAX_TRADES_PER_DAY})"
@@ -91,20 +105,21 @@ risk_manager = RiskManager()
 
 
 def position_size(price: float) -> int:
-    """How many shares to trade, capped by MAX_POSITION_VALUE. Always at least 1
-    so paper-mode logs still show a realistic quantity even for pricier stocks."""
+    """How many shares to trade: MAX_POSITION_VALUE when live,
+    PAPER_POSITION_VALUE in paper mode. Always at least 1."""
     if price <= 0:
         return 0
-    return max(1, int(MAX_POSITION_VALUE // price))
+    budget = MAX_POSITION_VALUE if LIVE_TRADING else PAPER_POSITION_VALUE
+    return max(1, int(budget // price))
 
 
-def place_order(symbol: str, side: str, price: float):
+def place_order(symbol: str, side: str, price: float, qty: int | None = None):
     """
     side: "BUY" or "SELL". Returns (qty, order_result_dict_or_None).
     In paper mode, order_result is None and nothing touches the network.
     In live mode, submits a real market order via Fyers and returns its response.
     """
-    qty = position_size(price)
+    qty = qty or position_size(price)
 
     if not LIVE_TRADING:
         return qty, None
@@ -116,7 +131,7 @@ def place_order(symbol: str, side: str, price: float):
         "qty": qty,
         "type": 2,          # 2 = market order
         "side": 1 if side == "BUY" else -1,
-        "productType": "INTRADAY",
+        "productType": PRODUCT_TYPE,
         "limitPrice": 0,
         "stopPrice": 0,
         "validity": "DAY",

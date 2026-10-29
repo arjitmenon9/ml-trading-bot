@@ -1,335 +1,132 @@
-# Smart Signal — ML Walkthrough
+# Smart Signal v2: ML walkthrough (October 2026)
 
-This explains what's in your project now, in plain English, and how to run
-it. Read section 0 first regardless of anything else — it sets expectations
-that matter for how you use (and write up) the rest of this.
+The v1 walkthrough is kept as `ML_WALKTHROUGH_v1.md`. This document covers what changed in v2, why, and how to run it.
 
-## 0. Set your expectations correctly first — this matters for your grade too
+---
 
-You asked for 100% profit and "highest accuracy of any model on the
-internet." Neither exists, for any stock, by anyone, ever, and it's worth
-understanding *why*, not just taking that on faith:
+## 0. Why v1 bought 2 stocks, never sold, and showed ₹0
 
-- If a model could predict price moves with near-100% accuracy, whoever ran
-  it would have an infinite money machine and would very quickly own the
-  entire market — capital would flow toward that strategy until its edge
-  vanished. Markets move on genuinely new information nobody has yet; that's
-  not a limitation of this codebase, it's closer to a law of how markets work.
-- Thousands of professional quant funds, with far more data, compute, and
-  data-source cleanliness than a 4-stock college project, spend billions of
-  dollars competing for tiny edges. Realistic, published, honestly-evaluated
-  accuracy for short-horizon equity direction prediction is usually in the
-  40-55% range for 3-way classification (vs. ~33% random chance) — genuinely
-  useful when combined with risk management, nowhere near "predicting the
-  future."
-- If you see a backtest or a claimed model anywhere online boasting 90%+
-  accuracy on this kind of task, the far more likely explanation is a bug
-  (almost always lookahead bias — the model accidentally got to peek at
-  future data) than a genuine breakthrough. This project's own backtest is
-  explicitly designed to avoid that bug — see section 3.
+| What you saw | Real cause | Fix in v2 |
+|---|---|---|
+| Live: 2 buys on 22 Oct, never sold | The v1 model only ever said BUY or HOLD for HDFCBANK and AUBANK, and the bot had **no exit rule** apart from a model SELL. Positions could stay open forever. | Every position now has a take-profit, a stop-loss and a 15-day time stop. Every trade closes. |
+| P&L stuck at ₹0 | The dashboard only counted *closed* trades. The 2 open positions were actually about −₹25. | Today's P&L = realized + unrealized. |
+| Live: 0 buys on 23 Oct | The bot ran all day on 22 Oct's Fyers token. Every quote came back "Please provide valid token". | The bot detects this, shows **FYERS TOKEN EXPIRED**, and reloads the token by itself when `get_token.py` saves a new one (no restart needed). |
+| SIM: −₹3.44 at 69% win rate | SIM never used the model. It was a random-walk price generator running the old rule-based score. | SIM now replays the model's real walk-forward trades on real NSE history. |
+| Signal flipping all day (BUY 981×, SELL 1053×, HOLD 1427× in one log) | v1 re-ran a daily-bar model every 10 s on a half-formed "today" bar. | Signals are computed **once a day**, from yesterday's completed bar, exactly as in training. |
 
-None of this means the project is pointless — it means the honest goal is
-"meaningfully better than a hand-tuned rule, evaluated fairly," not "never
-loses." That's also a *much* stronger thing to say in a college report than
-an unverifiable "100% profitable," which would (correctly) read as a red
-flag to anyone who evaluates it.
+## 1. The new question the model answers
 
-## 1. What actually changed, at a glance
+v1 tried to predict BUY / HOLD / SELL for the next 5 days (37% test accuracy, about coin-flip for 3 classes). v2 asks something narrower that the data can actually answer:
 
-Your original `bot.py` decided BUY/SELL/HOLD with a formula a human wrote:
-"+1 point if EMA9 is above EMA21, +2 points if RSI is under 40..." Machine
-learning replaces the guessing: an algorithm learns its own rule from
-thousands of historical examples of "here's what the indicators looked like"
-paired with "here's what actually happened next."
+> "If I buy this stock at **tomorrow's open** and exit at a **take-profit of 0.75 × ATR**, a **stop-loss of 4 × ATR**, or after **15 trading days**, will the trade make money **after Fyers charges**?"
 
-| File | Purpose |
+(ATR = the stock's average daily range. A typical take-profit is +1.5–2.5% and a typical stop −8–12%. Levels are clamped to 0.8–6% and 2–15%.)
+
+The model outputs P(win). The bot only buys the **rare setups where it is most confident**, and only if the stock passes a trend/volatility gate:
+- 200-day average rising, and price no more than 10% below it (no "falling knives");
+- ATR below 4% (not a wildly volatile stock);
+- India VIX below 30 (no panic markets).
+
+Portfolio rules: at most **3 new trades a day** and **10 open positions**, one position per stock.
+
+## 2. Data: 20 years × 191 stocks instead of 5 years × 4
+
+- History from the public **eod2** dataset (NSE bhavcopy, split/bonus adjusted; github.com/BennyThadikaran/eod2_data). It matches your Fyers history **to the paisa** on every overlapping day.
+- 191 liquid NSE stocks (NIFTY 50 + NIFTY Next 50 + large midcaps), 2007 → 13 Oct 2026, **740,519 stock-days**. Pre-2007 data is skipped (unadjusted splits), and demergers / data breaks are cut out.
+- NIFTY 50 and India VIX history for market-regime features.
+- `update_data.py` tops this up from Fyers every morning (the bot does it automatically after 9:15).
+
+## 3. Features (`features.py`): 48 in total, all scale-free
+
+- **Atlas Technicals tab indicators (new):** SMA 20/50/200, EMA 20 (as % distance from price), SMA50-vs-SMA200 gap, SMA200 slope.
+- **Kept from v1:** EMA 9/21 gap, RSI 14, MACD (now as % of price), Bollinger %B and width, rolling VWAP gap, Stochastic, ATR %, ADX (+ DI difference), CCI, Williams %R, OBV change, 52-week high/low distance, momentum 5/10/20, volatility, volume ratio.
+- **Short-term mean reversion (new):** RSI-2, RSI-5, 1/3/60-day returns, IBS (where the close sits in the day's range), opening gap, down-streak, distance from the 5-day low/high, 20-day z-score, volatility ratio.
+- **Market regime (new):** NIFTY 5/20-day momentum, distance from its 200-day average, NIFTY RSI-14/RSI-2, India VIX level and 5-day change, stock-vs-NIFTY relative strength (20/60 days).
+- **Cross-sectional (new):** each stock's rank among all 191 that day (5/20-day return, RSI-2, distance to SMA200, z-score, volume ratio, ATR) plus market breadth (% of stocks above SMA50, % down over 5 days).
+
+Every feature is a %, ratio or 0–100 oscillator, so one model can learn from all stocks at once.
+
+## 4. Model and validation (`train_model.py`)
+
+- **Model:** 3 averaged HistGradientBoosting classifiers (`ensemble.py`). Averaging makes the high-confidence tail, the only part that trades, less noisy.
+- **Walk-forward:** each year 2018–2026 is predicted by a model trained only on data that ended 30 days before that year began. No future data is ever used.
+- **Threshold:** model scores drift with the market regime, so a fixed probability cutoff does not transfer between years (tested: a cutoff chosen on 2018–21 gave just 3 trades in 2022–26). The bot instead buys the **top 0.3% of the last 250 trading days' scores**. That is a rolling threshold using only past scores; today it works out to P(win) ≥ 0.920.
+- **Choosing that 0.3%:** only 2018–2021 results were used. The rule was the most trades that reach a 92% win rate and a profit factor of at least 1.5 on 2018–21. A 92% calibration target was used because walk-forward results dropped about 5 points from calibration years to unseen years.
+- **Honest disclosure:** I tried several designs on the same history before settling on this one (exit rules, gate variants, bagging, gated vs ungated training). That design search touched 2022–2026, so treat the holdout as "very good evidence", not a perfectly untouched test.
+
+## 5. Results (all out-of-sample, after Fyers charges at ₹50,000 per trade)
+
+| | Trades | Win rate | Avg / trade | Profit factor |
+|---|---:|---:|---:|---:|
+| 2018–2021 (threshold chosen here) | 46 | 93.5% | +1.04% | 2.27 |
+| **2022 – Oct 2026 (holdout)** | **87** | **87.4%** | **+0.76%** | **2.04** |
+| All 2018–2026 | 133 | 89.5% | +0.86% | 2.12 |
+
+By year: 2018 100% (13), 2019 100% (9), 2020 50% (2), 2021 91% (22), 2022 86% (7), 2023 100% (12), 2024 90% (39), 2025 92% (12), **2026 71% (17)**.
+
+Exits: 119 take-profit, 9 time stop, 5 stop-loss. Winners average about +1.7% to +2.0%. Losers averaged −5.8% in 2022–26 and −12.6% in 2018–21, and the worst single trade was −15.4%. That asymmetry is the price of a high win rate: a single stop-out wipes out several wins.
+
+**What the high win rate does *not* mean:**
+1. **Not every year clears 85%.** 2026 so far is 71%.
+2. **It trades rarely:** about 16 trades a year across 191 stocks, about 1 a year on your 4 focus stocks. Many weeks will have no trade.
+3. **Modest total profit:** ₹57,011 over 8.2 years with up to ₹5 lakh reserved (10 × ₹50,000), about 1.3% a year on reserved capital. NIFTY buy-and-hold returned about 10% a year over the same window.
+4. **Position size matters a lot:**
+
+| ₹ per trade | Charges (round trip) | Win rate | Profit factor |
+|---:|---:|---:|---:|
+| 5,000 (current LIVE setting) | 1.33% | 85.0% | **0.97 (loses money)** |
+| 10,000 | 0.94% | 88.7% | 1.44 |
+| 25,000 | 0.57% | 89.5% | 1.95 |
+| 50,000 (paper mode) | 0.45% | 89.5% | 2.12 |
+
+Fyers' flat ₹20/order brokerage plus the ₹14.75 DP charge per sell dominate small trades. **Do not go live at ₹5,000 per trade.** `LIVE_TRADING` stays `False`; turning it on, and choosing `MAX_POSITION_VALUE`, is your decision.
+
+Charts: `reports/walkforward_equity.png`, `reports/walkforward_by_year.png`, `reports/backtest_v2.png`.
+
+## 6. How the bot runs each day (`bot.py`)
+
+1. You double-click **`start_today.command`**: Fyers login, then the bot and website start, and the browser opens `http://127.0.0.1:5000/#/bot`.
+2. **First scan after 9:15** (with a valid token): Fyers history top-up for 191 stocks and the indices (about 30–60 s). Then it scores every stock from yesterday's close, applies the gate, and buys up to 3 setups above today's threshold. Entries are allowed until 11:00.
+3. **Every ~10 s:** live quotes for the focus stocks and open positions. It sells at the take-profit or the stop.
+4. **15:20+:** sells positions that reached the 15-day time stop.
+5. Positions and trades are saved in `paper_trades.json`, so restarts no longer lose positions.
+
+Orders now use **CNC** (delivery). INTRADAY orders would have been force-closed by Fyers at about 3:15 PM, which can't work for multi-day holds.
+
+## 7. The ATLAS website (`atlas/`, `atlas_api.py`, `market_data.py`)
+
+`bot.py` serves the Atlas front end at http://127.0.0.1:5000 (the old dashboard is at `/classic`). `open_atlas.command` runs the website alone, with no bot and no login.
+
+| Section | Source (previously DEMO) |
 |---|---|
-| `features.py` | The ONE place that computes every indicator and defines what counts as a BUY/SELL/HOLD label. 22 features now (see section 4). |
-| `config.py` | Central, git-ignored storage for your Fyers credentials (replaces hard-coded secrets - see section 7). |
-| `auth.py` / `get_token.py` | The daily Fyers login routine (unchanged in spirit, now reads/writes through `config.py`). |
-| `generate_demo_data.py` | Fake but semi-realistic price history for instant, no-internet testing. |
-| `fetch_data_fyers.py` | Downloads REAL historical daily data from your Fyers account (see section 6). |
-| `fetch_data.py` | Real data from Yahoo Finance - kept as a fallback if Fyers' free-plan history lookback is too short for your needs. |
-| `train_model.py` | Trains and tunes multiple models, picks the best one honestly (see section 5). |
-| `predict_trend.py` | Stand-alone "what does the model currently think will happen" report (see section 8). |
-| `backtest.py` | Replays history to compare the ML model, your original rule-based bot, and buy-and-hold. |
-| `ml_signals.py` | Bridges the trained model into the *live* bot correctly (see section 9 on train/serve skew). |
-| `fyers_execution.py` | Where a decision becomes a real (or simulated) order, with position-size limits and a kill-switch (see section 10). |
-| `bot.py` | Wires all of the above together. Two real bugs fixed along the way - see section 11. |
+| Indices, stocks, forex, commodities, crypto, globe, heatmap | Yahoo Finance (delayed), plus **Fyers live** for the bot's symbols |
+| Asset page chart (1D…MAX), stats, 52-week range | Yahoo history |
+| Technicals tab | `features.py`, the same code the model uses |
+| **ATLAS ML model panel** on every NSE stock | the trained model: P(win), gate status, and the trade plan if it qualifies |
+| Overview / Financials / Shareholding / Peers / screener | Yahoo fundamentals |
+| India page | NIFTY sector indices, India VIX, NIFTY 50 breadth and movers, NSE FII/DII provisional flows |
+| News | Moneycontrol + Economic Times RSS, Yahoo per-stock news, Finnhub if `FINNHUB_API_KEY` is set |
+| Commodities | CommodityPriceAPI if `COMMODITY_API_KEY` is set, else Yahoo futures |
+| **Bot** (new nav item + "Today's Performance") | live bot state; **SIM** = model replay |
 
-## 2. Features vs. labels
+Not shown, because no free reliable source exists: GIFT Nifty, and the quarterly promoter/FII/DII shareholding split. Yahoo data is delayed and for personal use; read its terms before hosting the site publicly. If a source fails, that section falls back to its clearly labelled DEMO values.
 
-For every historical trading day we build a **feature vector** (22 numbers
-describing that day - see section 4) and a **label**: the "correct answer,"
-decided in hindsight by looking 5 trading days ahead. If price rose >1.5% →
-BUY, fell >1.5% → SELL, otherwise → HOLD (`LABEL_HORIZON` / `LABEL_THRESHOLD`
-in `features.py` - change these to forecast a different horizon).
+## 8. Commands
 
-## 3. Why the train/test split is by TIME, not randomly
+| Double-click | Does |
+|---|---|
+| `start_today.command` | every trading morning: login → bot + website |
+| `restart_clean.command` | restart the bot without logging in again |
+| `open_atlas.command` | website only |
+| `relogin_and_retrain.command` | monthly: login → `update_data.py` → full walk-forward retrain (20–40 min) → backtest |
+| `run_backtest.command` | prints the report above |
 
-The single most important idea here. Shuffling data before splitting would
-let the model "train" on a day in March and get "tested" on an earlier day
-in February — indirectly leaking the future into training (**lookahead
-bias**), the #1 reason beginner trading models look great in testing and
-lose money for real. `train_model.py` always trains on the OLDER 80% of each
-stock's history and tests on the most recent 20%. The hyperparameter tuning
-in Stage 2 (section 5) uses `TimeSeriesSplit` instead of ordinary K-fold
-cross-validation for the exact same reason — tuning can leak the future too
-if you're not careful.
+Command line: `python predict_trend.py [SYMBOL]`, `python update_data.py [--github]`, `python train_model.py [--final-only]`.
 
-## 4. The 22 features (up from 15)
+## 9. Limitations (for your report)
 
-**Original six, now vectorized correctly:** EMA9, EMA21 (and their %gap),
-RSI (proper Wilder smoothing), MACD (line/signal/histogram), Bollinger Bands
-(as %B and band-width), a 20-day rolling VWAP-gap (see the bug note in
-section 11 about why it's now a rolling window, not a lifetime cumulative
-one), and Stochastic Oscillator.
-
-**Added this round, all in `features.py`:**
-- **ATR (Average True Range)**, as % of price — how much a stock typically
-  moves per day, a volatility measure independent of direction.
-- **ADX (Average Directional Index)** — how *strong* the current trend is,
-  regardless of direction. Low = choppy/sideways, high = trending hard.
-  This is a genuinely useful complement to the directional indicators above:
-  a BUY signal during a strong uptrend (high ADX) means something different
-  than the same signal in a choppy market (low ADX).
-- **CCI (Commodity Channel Index)** — how far price has stretched from its
-  recent average, scaled by typical deviation.
-- **Williams %R** — similar idea to Stochastic, price's position within its
-  recent high/low range.
-- **OBV rate-of-change** — On-Balance Volume (a running volume-weighted
-  measure of buying vs. selling pressure) isn't comparable in raw form
-  across stocks, so we use its 10-day rate of change instead.
-- **Position in the 52-week range** — % distance from the 1-year high and
-  low, i.e. is this stock near a breakout or capitulating.
-- **Momentum** now includes a 20-day window in addition to 5- and 10-day.
-
-The feature importance chart (`reports/feature_importance.png`) tells you
-which of these 22 the winning model actually leans on for YOUR data - it's
-common (and a good sign, not a bad one) for several features to matter
-little; it means the model isn't grasping at noise.
-
-## 5. How model selection works now (Stage 1 + Stage 2)
-
-`train_model.py` runs in two stages:
-
-**Stage 1 - baseline comparison.** Trains a linear baseline (Logistic
-Regression) plus five tree-ensemble families with reasonable default
-settings: Random Forest, Extra Trees, sklearn's Gradient Boosting and
-HistGradientBoosting, and — if installed — **XGBoost** and **LightGBM**,
-the two boosting libraries that most consistently win real-world tabular-data
-competitions. All are evaluated on the same untouched, most-recent test
-slice.
-
-**Stage 2 - tuning.** Random Forest and (if available) XGBoost get a proper
-hyperparameter search — `RandomizedSearchCV` with `TimeSeriesSplit`
-cross-validation (20 random configurations each, scored by macro-F1) instead
-of hand-guessed settings. This is the ML equivalent of the original bot's
-score weights (+1, +2, -2...) being tuned by search instead of guessed by a
-human.
-
-**Selection.** Every model tried — baseline and tuned — is ranked by
-**macro-F1** on the held-out test set (`reports/model_comparison.png`), and
-whichever wins is saved as `models/model.pkl`. Macro-F1 (average of each
-class's F1 score) is used instead of raw accuracy because it doesn't let a
-model coast by always predicting the majority class (HOLD) — see the
-precision/recall explanation below.
-
-**Reading the per-model report:**
-```
-              precision    recall  f1-score   support
-        SELL       0.45      0.45      0.45       346
-        HOLD       0.44      0.21      0.29       460
-         BUY       0.39      0.63      0.48       350
-```
-- **precision** for BUY: of everything called BUY, what fraction actually
-  rallied? (Low = false alarms.)
-- **recall** for BUY: of everything that actually rallied, what fraction did
-  the model catch? (Low = missed opportunities.)
-- There's an unavoidable tension between the two — f1-score balances them.
-
-On the included demo run, the tuned Random Forest reached ~42% accuracy /
-0.41 macro-F1 (vs. ~33% random-chance for 3 balanced classes) — see section
-0 for why that's a reasonable, not disappointing, result, and re-read it
-once you retrain on real data and the number is similarly modest.
-
-## 6. Getting REAL data (three options, pick based on what works for you)
-
-**Fyers historical API (`fetch_data_fyers.py`) - what you asked for, and the
-most consistent choice** since it's the exact same data source your live bot
-trades on:
-```bash
-python auth.py            # prints a login URL
-python get_token.py       # paste the auth code it gives you back
-python fetch_data_fyers.py
-```
-Free/basic Fyers plans have lookback limits on historical daily data (often
-under a year) - the script fetches in yearly chunks and just gets however
-much your plan allows for older years; it won't error out, you'll just have
-less training data the further back you ask.
-
-**Yahoo Finance (`fetch_data.py`)** - already built, free, no login, useful
-if Fyers' lookback is too short for a solid training set. I could not test
-either fetcher end-to-end myself — I have no internet access in this
-sandbox — so run whichever you choose yourself and watch for errors; the
-scripts print clear diagnostics either way.
-
-**NSE's own website** — you asked about pulling directly from
-nseindia.com. Worth knowing before you try: NSE's site has aggressive
-bot-detection (session cookies, changing endpoints, rate limits) and isn't
-built for casual scripted downloads the way Yahoo's or a broker's API is.
-Its official EOD "bhavcopy" archives are public and downloadable, but
-scraping them reliably usually needs browser-like headers/cookies and
-tends to break when NSE tweaks its site. Given Fyers already gives you
-consistent, broker-grade data, I'd only chase this if you specifically need
-"NSE said so" for your report — happy to build it if you want it after
-trying the two options above.
-
-Whichever you use, retrain afterward:
-```bash
-python train_model.py
-python backtest.py
-python predict_trend.py
-```
-Both `bot.py` and `train_model.py` print a loud warning if the currently
-loaded model was trained on demo data — that warning should be gone before
-you trust any live signal.
-
-## 7. Credentials: no more secrets hard-coded in the code
-
-Your original `auth.py`, `get_token.py`, and `bot.py` each had your Fyers
-App ID, secret key, and access token typed directly into the file - a real
-risk the moment this is pushed to GitHub for your group project. Now:
-- `fyers_secrets.json` (git-ignored, see `.gitignore`) holds all of it in
-  one place. I've already created it on your machine with your existing
-  app_id/secret_key (nothing else changed about your Fyers app).
-- `fyers_secrets.example.json` (safe to commit) shows the shape for a
-  teammate setting this up fresh.
-- Every script that needs Fyers now goes through `config.py` instead of
-  having its own copy-pasted token.
-- Fyers access tokens still expire every day (a Fyers platform rule) - run
-  `auth.py` then `get_token.py` each morning before trading; the fresh
-  token is saved automatically and every other script just picks it up.
-
-**You should still rotate your actual secret key** on myapi.fyers.in at some
-point, since it was previously visible in plaintext in files that may already
-have been shared - this refactor stops the bleeding going forward, it
-doesn't undo prior exposure.
-
-## 8. "Predicting future trends" — `predict_trend.py`
-
-Run this any time for a snapshot:
-```
-python predict_trend.py
-```
-```
-Symbol      Outlook (next ~5 trading days)          Confidence
-HDFCBANK    HOLD (expect sideways movement)             37.2%
-RELIANCE    SELL (expect a decline)                     44.6%
-```
-Important honesty note, also printed by the script itself: the label means
-"the model expects a >1.5% move within 5 trading days," not a specific price
-target, and the confidence score reflects how strongly the model's internal
-votes agree — not a calibrated "probability of being correct." The model's
-overall `test_accuracy` / `test_f1_macro` (in `models/metadata.json`) is a
-better guide to how much to trust it than any single day's confidence
-number. `bot.py` computes this same forecast continuously while running live.
-
-## 9. Wiring into the live bot without breaking the model (train/serve skew)
-
-`train_model.py` learns from **daily** bars; the live bot polls a quote
-every ~10 seconds. Feeding raw ticks into "EMA21" would produce "average of
-the last ~8 minutes," nothing like the daily EMA21 the model actually
-learned from - a real ML failure mode called **train/serve skew**, where
-live features don't match training features and predictions become
-meaningless. `ml_signals.py`'s `LiveFeatureBuilder` fixes this by keeping a
-real daily-bar history per symbol (loaded from `data/<SYMBOL>.csv`) plus a
-continuously-updating "today so far" bar, so every prediction is computed on
-daily-bar-shaped data just like training was.
-
-## 10. Live trading safety — paper mode, position limits, kill-switch
-
-You chose to start in **paper mode**, which is the default and is exactly
-what `fyers_execution.py` implements: `LIVE_TRADING = False` means the bot
-connects to your real account and real market data, computes real signals,
-but every order is only logged (`state[...]["orders"]`) - nothing reaches
-the exchange.
-
-When and if you're ready to flip `LIVE_TRADING = True` in
-`fyers_execution.py`, three things are already built in:
-- **`MAX_POSITION_VALUE`** (default Rs.5000) - caps how much any single
-  trade risks, computed into a share quantity automatically.
-- **`DAILY_LOSS_LIMIT`** (default Rs.2000) - if today's realized P&L drops
-  past -this, the **kill-switch** trips and the bot stops opening new
-  positions for the rest of the day (it leaves existing positions alone
-  rather than force-closing them, since that's its own decision with its
-  own risk).
-- **`MAX_TRADES_PER_DAY`** (default 40) - a safety net against a bug that
-  flips signals rapidly and churns trades.
-
-These limits are active in paper mode too (harmlessly, since no real money
-moves), which means you can watch the kill-switch logic actually fire during
-paper trading before you ever risk money on it. Recommended before flipping
-the switch: run several full paper-trading sessions, read the trade log, set
-both limits to numbers you're genuinely fine losing completely, and start
-small. This project - like any college-project-stage model - cannot promise
-a level of profitability; automated trading can lose money quickly if left
-unmonitored.
-
-## 11. Bugs found and fixed along the way
-
-1. **RSI silently froze.** The original `calculate_rsi()` always read
-   `prices[0:period+1]` — the *oldest* ticks ever collected — instead of a
-   rolling recent window, so RSI locked at whatever it was after the first
-   15 ticks and never updated again all day. Fixed to use
-   `prices[-(period+1):]`.
-2. **The bot crashed once it had collected 10-14 ticks.** `NEEDED = 10`
-   lets scoring start before `calculate_rsi`/`calculate_macd` have enough
-   points internally (they need 15 / 35), so they return `None` - and the
-   original status-line print formatted `rsi` with `:.1f` unconditionally,
-   crashing with `TypeError: unsupported format string passed to
-   NoneType.__format__` the first time that happened. Fixed to print `n/a`
-   until real values exist.
-3. **VWAP drifted meaninglessly over a multi-year dataset.** The original
-   VWAP was cumulative from the very first row of price history - fine for
-   an intraday VWAP that resets daily, not fine for years of daily bars,
-   where it drifts arbitrarily far from price and its value depends on how
-   much history happens to be loaded (not a stable, comparable feature).
-   Changed to a rolling 20-day VWAP.
-
-## 12. How to run everything, start to finish
-
-```bash
-cd "ml code"
-source venv/bin/activate
-pip install -r requirements_ml.txt
-
-# Get real data (pick one - see section 6):
-python auth.py && python get_token.py && python fetch_data_fyers.py
-#   -- or --
-python fetch_data.py
-#   -- or, for instant no-internet testing --
-python generate_demo_data.py
-
-python train_model.py       # trains + tunes + saves models/model.pkl
-python backtest.py          # reports/backtest_equity_curves.png
-python predict_trend.py     # today's outlook per stock
-
-python bot.py                # paper trading by default (see section 10)
-```
-
-## 13. Honest limitations (good material for your project report)
-
-- Small universe (4 stocks); a model tuned here may not generalize elsewhere.
-- Backtest has no fees/slippage and 1-unit position sizing.
-- Fixed label threshold (1.5% over 5 days) rather than volatility-adjusted
-  per stock.
-- One static train/test split, not a rolling walk-forward evaluation
-  (retrain periodically as new data arrives) - a natural next step, and
-  explicitly called out as future work in your synopsis.
-- Confidence scores are not calibrated probabilities.
-- This is, and will remain, a college-project-stage system: real trading
-  firms combine models like this with far more data, execution
-  sophistication, and risk infrastructure. Treat it as a genuine, honestly-
-  evaluated demonstration of the ML pipeline - which is what the synopsis
-  actually asks for - not a finished trading product.
+- **Survivorship bias:** the universe is today's large caps. Companies that collapsed and left the index aren't in the history, which flatters dip-buying a little.
+- **Fills:** the backtest assumes entry at the open and exit exactly at the target/stop. Gaps through the stop are modelled; intraday slippage beyond 0.05% per side is not.
+- **Regime risk:** the strategy buys pullbacks in uptrends. A sharp market-wide crash (2020, early 2026) produces the losses.
+- **Small sample:** 133 out-of-sample trades. The 95% confidence interval on an 89.5% win rate is roughly 84–95%.
+- Nothing here is investment advice.

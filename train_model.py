@@ -1,386 +1,329 @@
 """
-train_model.py
-===============
-This is the heart of the ML pipeline. Read the comments top-to-bottom -
-they're written for someone who has never trained a model before.
+train_model.py  (v2: swing-trade filter, walk-forward validated)
+=================================================================
+Trains the model the bot trades on, measures it honestly, and saves it.
 
-WHAT WE'RE DOING, IN PLAIN ENGLISH
------------------------------------
-Your original bot decides BUY/SELL/HOLD with a hand-written scoring rule
-("+1 if EMA9>EMA21, +2 if RSI<40, ..."). Those weights (+1, +2, -2...) were
-guessed by a human. Machine learning replaces the guessing: we show the
-computer thousands of past examples of "here's what the indicators looked
-like on some day" paired with "here's what actually happened next," and let
-an algorithm figure out its own weights/rules from the data.
+WHAT CHANGED FROM v1 AND WHY
+----------------------------
+v1 tried to predict BUY / HOLD / SELL for the next 5 days on 4 stocks x 5
+years. Test accuracy was 37% (barely above the 33% coin-flip for 3
+classes). Live, the signal flipped every few seconds because it was re-run
+on a half-formed daily bar, and SIM mode wasn't using the model at all.
 
-Concretely, for every historical trading day we build:
-  - a FEATURE VECTOR: the indicator values on that day (22 of them - see
-    features.py: EMA/RSI/MACD/Bollinger/VWAP/Stochastic plus ATR, ADX, CCI,
-    Williams %R, OBV rate-of-change, and 52-week-range position)
-  - a LABEL: what SHOULD have been done that day, decided in hindsight by
-    looking 5 days into the future (see features.py: LABEL_HORIZON/THRESHOLD)
+v2 asks a narrower question the data can actually answer:
 
-WHY WE SPLIT DATA BY TIME, NOT RANDOMLY
------------------------------------------
-If we shuffled and split randomly, the model could "train" on a day in March
-and be "tested" on a day in February that came before it - indirectly
-leaking the future into training. That's LOOKAHEAD BIAS, the #1 way
-beginner trading models look great in testing and lose money in reality.
-Every split here - both the final train/test split AND the cross-validation
-used for tuning below - respects time order.
+    "If I buy this stock at tomorrow's open and exit with the rules in
+     strategy.py (take-profit / stop-loss / 15-day time stop), will the
+     trade make money AFTER Fyers charges?"
 
-HOW WE TRY TO GET THE BEST ACCURACY WE HONESTLY CAN
-------------------------------------------------------
-1. Train several very different model families and compare them fairly on
-   the same held-out future data: a linear baseline (Logistic Regression),
-   three tree-ensemble families (Random Forest, Extra Trees, sklearn's
-   Gradient Boosting / HistGradientBoosting), and two industry-standard
-   boosting libraries (XGBoost, LightGBM) if installed - these are
-   consistently what wins Kaggle competitions on tabular data like this.
-2. For the two strongest tree ensembles, run RandomizedSearchCV with
-   TimeSeriesSplit cross-validation to tune hyperparameters properly,
-   instead of guessing numbers by hand - the ML equivalent of the rule-based
-   bot's hand-guessed score weights, done automatically and validated.
-3. Pick whichever model actually wins on the untouched, most-recent,
-   held-out slice of data - not whichever "sounds fancier."
+and only trades when the model is very sure. It learns from ~190 liquid NSE
+stocks over 2007-2026 (~730,000 stock-days) instead of 4 stocks x 5 years.
 
-READ THIS BEFORE TRUSTING ANY NUMBER THIS SCRIPT PRINTS: short-horizon stock
-price movement is one of the noisiest, most heavily-arbitraged prediction
-problems that exists - thousands of professional quant funds compete to
-find any edge, which erodes it fast. No legitimate model gets anywhere near
-90%+ accuracy predicting 3-way BUY/SELL/HOLD on daily equities, and any
-result that looks THAT good almost always means a bug (usually lookahead
-bias) rather than a breakthrough. Treat 40-55% (vs. ~33% random-chance
-baseline for 3 classes) as a genuinely good, plausible result.
+HOW IT IS VALIDATED (no peeking at the future)
+----------------------------------------------
+1. Walk-forward: for every year Y from 2018 on, a model is trained ONLY on
+   data that ended 30 days before 1 Jan Y, then predicts every stock-day in Y.
+   Those are genuine out-of-sample predictions.
+2. Those predictions are turned into trades with the bot's real portfolio
+   rules (one position per stock, at most CAP_PER_DAY new trades a day,
+   at most MAX_OPEN open at once, Fyers charges on a POSITION_VALUE trade).
+3. The buy threshold is chosen using ONLY the 2018-2021 out-of-sample
+   trades: the lowest model confidence that gave >= TARGET_WIN_RATE with a
+   healthy profit factor.
+4. That frozen threshold is then scored on 2022-today, which played no part
+   in choosing anything. THAT is the number to believe.
+5. The deployed model is retrained on all data with the same settings.
 
-OUTPUT
-------
-- models/model.pkl + models/metadata.json   the selected model + its info
-- reports/confusion_matrix.png, feature_importance.png, model_comparison.png
-- prints a full evaluation report to the console
+Run:   python train_model.py            (full walk-forward, ~20-40 min)
+       python train_model.py --final-only  (refit on the latest data and keep
+                                            the threshold already chosen; ~3 min)
+Outputs: models/model.pkl, models/metadata.json, models/oos_trades.csv,
+         reports/walkforward_equity.png, reports/walkforward_by_year.png
 """
+from __future__ import annotations
+
+import argparse
+import datetime as dt
 import json
+import time
 import warnings
-from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from sklearn.ensemble import (
-    RandomForestClassifier, ExtraTreesClassifier,
-    GradientBoostingClassifier, HistGradientBoostingClassifier,
-)
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
 
-from features import build_dataset, FEATURE_COLUMNS
+import strategy
+from ensemble import BaggedHGB
+from features import FEATURE_COLUMNS, MODEL_FEATURES, add_cross_section, build_features
+from universe import BASE_DIR, FOCUS_SYMBOLS, all_symbols, load_history, load_market, segments
 
 warnings.filterwarnings("ignore")
+MODEL_DIR = BASE_DIR / "models"
+REPORT_DIR = BASE_DIR / "reports"
 
-DATA_DIR = Path(__file__).parent / "data"
-MODEL_DIR = Path(__file__).parent / "models"
-REPORT_DIR = Path(__file__).parent / "reports"
-TEST_FRACTION = 0.2  # most recent 20% of each stock's history is held out for testing
-LABEL_NAMES = {1: "BUY", 0: "HOLD", -1: "SELL"}
-LABEL_TO_CODE = {-1: 0, 0: 1, 1: 2}   # XGBoost/LightGBM require labels 0..K-1
-CODE_TO_LABEL = {v: k for k, v in LABEL_TO_CODE.items()}
-
-try:
-    from xgboost import XGBClassifier
-    HAS_XGB = True
-except ImportError:
-    HAS_XGB = False
-
-try:
-    from lightgbm import LGBMClassifier
-    HAS_LGBM = True
-except ImportError:
-    HAS_LGBM = False
+# ---- strategy + portfolio settings (the bot reads these from metadata.json)
+TP_ATR, SL_ATR, MAX_HOLD = 0.75, 4.0, 15
+CAP_PER_DAY = 3            # new positions per day
+MAX_OPEN = 10              # open positions at once
+POSITION_VALUE = 50_000    # rupees per trade used for charges in the backtest
+TARGET_WIN_RATE = 0.92     # on 2018-2021. Walk-forward tests lost ~5 points from calibration
+                           # to unseen years, so 92% here is what keeps unseen years >= 85%
+N_BAG = 3                  # models averaged in the ensemble
+QUANTILES = [0.97, 0.98, 0.99, 0.995, 0.997]   # candidate "top x%" thresholds
+WINDOW = 250               # trading days of past scores the threshold is set from
+MIN_PROFIT_FACTOR = 1.5
+MIN_CALIB_TRADES = 30
+WF_FIRST_YEAR, CALIB_LAST_YEAR = 2018, 2021
+EMBARGO = pd.Timedelta(days=30)   # > MAX_HOLD trading days, so labels never leak
 
 
-class RelabeledClassifier:
-    """
-    Wraps a classifier that insists on labels 0..K-1 (XGBoost, LightGBM) so
-    it exposes the exact same .fit/.predict/.predict_proba/.feature_importances_
-    interface as every native sklearn model here, using our natural -1/0/1
-    (SELL/HOLD/BUY) labels. This means ml_signals.py never needs to know or
-    care which library actually produced the winning model.
-    """
-    def __init__(self, inner):
-        self.inner = inner
-
-    def fit(self, X, y):
-        y_code = pd.Series(y).map(LABEL_TO_CODE).values
-        self.inner.fit(X, y_code)
-        return self
-
-    def predict(self, X):
-        codes = self.inner.predict(X)
-        return np.array([CODE_TO_LABEL[c] for c in codes])
-
-    def predict_proba(self, X):
-        return self.inner.predict_proba(X)
-
-    @property
-    def feature_importances_(self):
-        return self.inner.feature_importances_
+def make_model():
+    return BaggedHGB(n=N_BAG, max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
+                     min_samples_leaf=400, l2_regularization=1.0)
 
 
-def load_all_symbols() -> pd.DataFrame:
-    """Load every CSV in data/, compute features+labels, tag each row with its symbol."""
-    frames = []
-    for csv_path in sorted(DATA_DIR.glob("*.csv")):
-        symbol = csv_path.stem
-        raw = pd.read_csv(csv_path, parse_dates=["date"]).sort_values("date")
-        ds = build_dataset(raw)
-        ds["symbol"] = symbol
-        frames.append(ds)
-        print(f"  {symbol}: {len(ds)} usable rows after feature/label computation")
-    if not frames:
-        raise SystemExit(
-            "No CSV files found in data/. Run generate_demo_data.py (quick test), "
-            "fetch_data_fyers.py (real data via your broker), or fetch_data.py "
-            "(real data via Yahoo Finance) first."
-        )
-    return pd.concat(frames, ignore_index=True)
+# ---------------------------------------------------------------------------
+# dataset
+# ---------------------------------------------------------------------------
+def build_dataset(verbose=True) -> pd.DataFrame:
+    t0 = time.time()
+    mkt = load_market()
+    cost = strategy.round_trip_cost(POSITION_VALUE)
+    parts = []
+    syms = all_symbols()
+    for sym in syms:
+        for seg in segments(load_history(sym)):
+            x = build_features(seg, mkt)
+            ret, days, why = strategy.simulate_outcomes(x, TP_ATR, SL_ATR, MAX_HOLD)
+            dates = x["date"].to_numpy()
+            n = len(x)
+            ent_i = np.minimum(np.arange(n) + 1, n - 1)
+            ex_i = np.minimum(np.arange(n) + np.nan_to_num(days, nan=0).astype(int), n - 1)
+            g = x[["date"] + FEATURE_COLUMNS].copy()
+            g["symbol"] = sym
+            g["gross_ret"] = ret
+            g["net_ret"] = ret - cost
+            g["days"] = days
+            g["why"] = why
+            g["entry_date"] = dates[ent_i]
+            g["exit_date"] = dates[ex_i]
+            g["entry_px"] = x["open"].to_numpy()[ent_i]
+            parts.append(g)
+    a = pd.concat(parts, ignore_index=True)
+    a = a.dropna(subset=["dist_sma200"])  # need ~1 year of history for every feature
+    a = add_cross_section(a)                # ranks vs the whole universe that day
+    a["gate"] = strategy.passes_gate(a).to_numpy()   # setups the bot may trade
+    a["y"] = (a["net_ret"] > 0).astype(int)
+    if verbose:
+        print(f"  gate {strategy.GATE}: {int(a['gate'].sum()):,} of {len(a):,} stock-days are tradable setups "
+              f"(the model learns from all of them; the gate only filters what it buys)")
+    if verbose:
+        lab = a["net_ret"].notna()
+        print(f"  dataset: {len(a):,} stock-days, {a['symbol'].nunique()} stocks, "
+              f"{a['date'].min().date()} -> {a['date'].max().date()} ({time.time()-t0:.0f}s)")
+        print(f"  base rate (buy every day, no model): win {a.loc[lab,'y'].mean():.1%}, "
+              f"avg net {a.loc[lab,'net_ret'].mean()*100:+.2f}% per trade")
+    return a
 
 
-def chronological_split(df: pd.DataFrame):
-    """Split each symbol's rows by date so TEST is always the most recent slice."""
-    train_parts, test_parts = [], []
-    for symbol, group in df.groupby("symbol"):
-        group = group.sort_values("date")
-        cutoff = int(len(group) * (1 - TEST_FRACTION))
-        train_parts.append(group.iloc[:cutoff])
-        test_parts.append(group.iloc[cutoff:])
-    return pd.concat(train_parts, ignore_index=True), pd.concat(test_parts, ignore_index=True)
+# ---------------------------------------------------------------------------
+# portfolio simulation (same rules as the live bot)
+# ---------------------------------------------------------------------------
+def select_trades(pred: pd.DataFrame, th: float, cap=CAP_PER_DAY, max_open=MAX_OPEN) -> pd.DataFrame:
+    """pred: rows with date, symbol, p, net_ret, entry_date, exit_date, ...
+    Walks forward day by day, opening the highest-p candidates first."""
+    c = pred[(pred["p"] >= th) & pred["net_ret"].notna()].sort_values(["date", "p"], ascending=[True, False])
+    open_until: dict[str, pd.Timestamp] = {}
+    keep = []
+    for day, g in c.groupby("date", sort=True):
+        open_until = {s: e for s, e in open_until.items() if e >= day}
+        new = 0
+        for idx, r in g.iterrows():
+            if new >= cap or len(open_until) >= max_open:
+                break
+            if r["symbol"] in open_until:
+                continue
+            open_until[r["symbol"]] = r["exit_date"]
+            keep.append(idx)
+            new += 1
+    return c.loc[keep]
 
 
-def evaluate(name, model, X_test, y_test, results):
-    preds = model.predict(X_test)
-    acc = accuracy_score(y_test, preds)
-    f1m = f1_score(y_test, preds, average="macro")
-    results[name] = {"model": model, "preds": preds, "accuracy": acc, "f1_macro": f1m}
-    print(f"\n--- {name} ---  accuracy={acc:.3f}  f1_macro={f1m:.3f}")
-    print(classification_report(y_test, preds, target_names=["SELL", "HOLD", "BUY"],
-                                 labels=[-1, 0, 1], zero_division=0))
+def stats(t: pd.DataFrame) -> dict:
+    if not len(t):
+        return {"n": 0}
+    gp, gl = t.loc[t.net_ret > 0, "net_ret"].sum(), -t.loc[t.net_ret < 0, "net_ret"].sum()
+    return {"n": int(len(t)), "win_rate": float((t.net_ret > 0).mean()),
+            "avg_net_ret": float(t.net_ret.mean()), "profit_factor": float(gp / gl) if gl > 0 else None,
+            "avg_win": float(t.loc[t.net_ret > 0, "net_ret"].mean()) if (t.net_ret > 0).any() else None,
+            "avg_loss": float(t.loc[t.net_ret <= 0, "net_ret"].mean()) if (t.net_ret <= 0).any() else None,
+            "total_pnl_rs": float(t.net_ret.sum() * POSITION_VALUE),
+            "avg_days": float(t.days.mean())}
 
 
-def tune_with_time_series_cv(name, base_estimator, param_dist, X_train, y_train, n_iter=20):
-    """
-    RandomizedSearchCV, but with TimeSeriesSplit instead of the default
-    random K-fold - each fold trains on an earlier slice and validates on a
-    later one, same rule as the main train/test split, so tuning itself
-    can't cheat by peeking at the future either.
-    """
-    print(f"\nTuning {name} with time-respecting cross-validation ({n_iter} random configs)...")
-    search = RandomizedSearchCV(
-        base_estimator, param_dist, n_iter=n_iter,
-        cv=TimeSeriesSplit(n_splits=4), scoring="f1_macro",
-        random_state=42, n_jobs=-1,
-    )
-    search.fit(X_train, y_train)
-    print(f"  best CV f1_macro: {search.best_score_:.3f}  params: {search.best_params_}")
-    return search.best_estimator_
+def rolling_threshold(pred: pd.DataFrame, q: float, window: int = WINDOW) -> pd.Series:
+    """Causal threshold per date: the q-quantile of ALL scores from the
+    previous `window` trading days (never the same day or the future).
+    Model scores drift with the market regime, so "top x% of recent scores"
+    transfers between years far better than a fixed probability does."""
+    daily = pred.groupby("date")["p"].apply(lambda x: x.to_numpy())
+    out = {}
+    for i, d in enumerate(daily.index):
+        out[d] = np.quantile(np.concatenate(daily.iloc[max(0, i - window):i].to_numpy()), q) if i >= 60 else 1.0
+    return pred["date"].map(out)
+
+
+def trades_at(pred: pd.DataFrame, q: float) -> pd.DataFrame:
+    """Threshold from ALL recent scores, then only gated setups may trade."""
+    x = pred.assign(th=rolling_threshold(pred, q))
+    return select_trades(x[(x["p"] >= x["th"]) & x["gate"]], 0.0)
+
+
+def choose_quantile(pred: pd.DataFrame):
+    """Lowest q (= most trades) whose CALIBRATION-years trades meet the target."""
+    rows = []
+    for q in QUANTILES:
+        t = trades_at(pred, q)
+        cal = stats(t[t["fold"] <= CALIB_LAST_YEAR])
+        rows.append((q, cal, t))
+        print(f"    q={q}: calibration {cal.get('n',0)} trades, win {cal.get('win_rate',0):.1%}, "
+              f"PF {cal.get('profit_factor') or 0:.2f}")
+    ok = [r for r in rows if r[1].get("n", 0) >= MIN_CALIB_TRADES and r[1]["win_rate"] >= TARGET_WIN_RATE
+          and (r[1]["profit_factor"] or 0) >= MIN_PROFIT_FACTOR]
+    if ok:
+        return ok[0]
+    print("  ! no quantile met the target on calibration years; using the best one")
+    rows = [r for r in rows if r[1].get("n", 0) >= 20] or rows
+    return max(rows, key=lambda r: (r[1].get("win_rate", 0), r[1].get("profit_factor") or 0))
+
+
+# ---------------------------------------------------------------------------
+def walk_forward(a: pd.DataFrame) -> pd.DataFrame:
+    last_year = int(a["date"].max().year)
+    out = []
+    for Y in range(WF_FIRST_YEAR, last_year + 1):
+        t0 = time.time()
+        y0 = pd.Timestamp(f"{Y}-01-01")
+        tr = a[(a["date"] < y0 - EMBARGO) & a["net_ret"].notna()]
+        te = a[(a["date"] >= y0) & (a["date"] < pd.Timestamp(f"{Y+1}-01-01"))].copy()
+        m = make_model().fit(tr[MODEL_FEATURES], tr["y"])
+        te["p"] = m.predict_proba(te[MODEL_FEATURES])[:, 1]
+        te["fold"] = Y
+        out.append(te)
+        print(f"  fold {Y}: trained on {len(tr):,} rows up to {(y0-EMBARGO).date()}, "
+              f"scored {len(te):,} ({time.time()-t0:.0f}s)", flush=True)
+    return pd.concat(out, ignore_index=True)
+
+
+def plots(trades: pd.DataFrame, th: float):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    REPORT_DIR.mkdir(exist_ok=True)
+    t = trades.sort_values("exit_date")
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    eq = (t["net_ret"] * POSITION_VALUE).cumsum()
+    ax.plot(pd.to_datetime(t["exit_date"]), eq, color="#1f9d6b", lw=1.8)
+    ax.axvline(pd.Timestamp(f"{CALIB_LAST_YEAR+1}-01-01"), color="#888", ls="--", lw=1)
+    ax.text(pd.Timestamp(f"{CALIB_LAST_YEAR+1}-02-01"), ax.get_ylim()[0], "  holdout (threshold frozen) →", color="#555", va="bottom")
+    ax.set_title(f"Walk-forward paper P&L, Rs {POSITION_VALUE:,}/trade after charges (threshold {th:.3f})")
+    ax.set_ylabel("cumulative P&L (Rs)"); ax.grid(alpha=.25)
+    fig.tight_layout(); fig.savefig(REPORT_DIR / "walkforward_equity.png", dpi=130); plt.close(fig)
+    by = t.groupby(pd.to_datetime(t["entry_date"]).dt.year)["net_ret"].agg(n="size", win=lambda r: (r > 0).mean())
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    ax.bar(by.index.astype(str), by["win"] * 100, color=["#7a8" if int(y) <= CALIB_LAST_YEAR else "#1f9d6b" for y in by.index])
+    ax.axhline(85, color="#c44", ls="--", lw=1); ax.set_ylim(0, 100); ax.set_ylabel("win rate %")
+    for i, (n, w) in enumerate(zip(by["n"], by["win"])):
+        ax.text(i, w * 100 + 1, f"{w:.0%}\n{n} tr", ha="center", fontsize=8)
+    ax.set_title("Out-of-sample win rate by year (light = threshold-calibration years)")
+    fig.tight_layout(); fig.savefig(REPORT_DIR / "walkforward_by_year.png", dpi=130); plt.close(fig)
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--final-only", action="store_true", help="refit on all data, keep saved threshold")
+    args = ap.parse_args()
     MODEL_DIR.mkdir(exist_ok=True)
-    REPORT_DIR.mkdir(exist_ok=True)
+    print("=" * 70 + "\n  Building dataset\n" + "=" * 70)
+    a = build_dataset()
+    old_meta = {}
+    if (MODEL_DIR / "metadata.json").exists():
+        old_meta = json.loads((MODEL_DIR / "metadata.json").read_text())
 
-    print("Loading data and building features/labels...")
-    df = load_all_symbols()
+    if args.final_only:
+        if "quantile" not in old_meta:
+            raise SystemExit("No saved threshold yet - run the full `python train_model.py` once.")
+        q = old_meta["quantile"]
+        meta_eval = {k: old_meta.get(k) for k in ("calibration", "holdout", "oos_all", "by_year", "focus_symbols_oos", "quantile")}
+    else:
+        print("=" * 70 + "\n  Walk-forward (each year predicted by a model that never saw it)\n" + "=" * 70)
+        pred = walk_forward(a)
+        calib = pred[pred["fold"] <= CALIB_LAST_YEAR]
+        hold = pred[pred["fold"] > CALIB_LAST_YEAR]
+        print("  choosing the threshold on 2018-%d only:" % CALIB_LAST_YEAR)
+        q, s_cal, t_all = choose_quantile(pred)
+        th = q
+        t_hold = t_all[t_all["fold"] > CALIB_LAST_YEAR]
+        t_cal = t_all[t_all["fold"] <= CALIB_LAST_YEAR]
+        s_hold, s_all = stats(t_hold), stats(t_all)
+        by_year = {int(y): stats(g) for y, g in t_all.groupby("fold")}
+        print("\n" + "=" * 70 + "\n  RESULTS (all out-of-sample, after Fyers charges)\n" + "=" * 70)
+        print(f"  threshold chosen on 2018-{CALIB_LAST_YEAR}: buy the top {(1-q)*100:.1f}% of the last {WINDOW} days' scores")
+        fmt = lambda s: (f"{s['n']:4d} trades | win {s['win_rate']:.1%} | avg {s['avg_net_ret']*100:+.2f}% | "
+                         f"PF {s['profit_factor'] or float('nan'):.2f} | P&L Rs {s['total_pnl_rs']:,.0f}") if s.get("n") else "no trades"
+        print(f"  calibration 2018-{CALIB_LAST_YEAR}: {fmt(stats(t_cal))}")
+        print(f"  HOLDOUT {CALIB_LAST_YEAR+1}-now  : {fmt(s_hold)}   <- the honest number")
+        for y, s in by_year.items():
+            print(f"    {y}: {fmt(s)}")
+        foc = t_all[t_all["symbol"].isin(FOCUS_SYMBOLS)]
+        print(f"  focus stocks {FOCUS_SYMBOLS}: {fmt(stats(foc))}")
+        cols = ["symbol", "date", "entry_date", "exit_date", "entry_px", "p", "th", "net_ret", "gross_ret", "days", "why", "fold"]
+        recent = pred[pred["date"] >= sorted(pred["date"].unique())[-WINDOW]][["date", "symbol", "p"]]
+        recent.assign(date=recent["date"].dt.strftime("%Y-%m-%d")).to_csv(MODEL_DIR / "recent_scores.csv", index=False)
+        o = t_all[cols].copy()
+        o["exit_reason"] = o["why"].map({1.0: "target", -1.0: "stop", 0.0: "time"})
+        o["set"] = np.where(o["fold"] <= CALIB_LAST_YEAR, "calibration", "holdout")
+        for c in ("date", "entry_date", "exit_date"):
+            o[c] = pd.to_datetime(o[c]).dt.strftime("%Y-%m-%d")
+        o.rename(columns={"date": "signal_date"}).to_csv(MODEL_DIR / "oos_trades.csv", index=False)
+        plots(t_all, float(rolling_threshold(pred, q).iloc[-1]))
+        meta_eval = {"calibration": s_cal, "holdout": s_hold, "oos_all": s_all, "by_year": by_year,
+                     "focus_symbols_oos": stats(foc), "quantile": q}
 
-    print(f"\nLabel balance (full dataset):")
-    print(df["label"].map(LABEL_NAMES).value_counts().to_string())
-
-    train_df, test_df = chronological_split(df.sort_values("date"))
-    print(f"\nTrain rows: {len(train_df)}  (earliest bars per stock)")
-    print(f"Test rows:  {len(test_df)}  (most recent {int(TEST_FRACTION*100)}% per stock, held out)")
-
-    X_train, y_train = train_df[FEATURE_COLUMNS], train_df["label"]
-    X_test, y_test = test_df[FEATURE_COLUMNS], test_df["label"]
-
-    print("\n" + "=" * 78)
-    print("STAGE 1: BASELINE MODEL COMPARISON  (accuracy on held-out, never-seen data)")
-    print("=" * 78)
-    results = {}
-
-    baselines = {
-        "Logistic Regression (baseline)": LogisticRegression(max_iter=1000, class_weight="balanced"),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=300, max_depth=6, min_samples_leaf=20,
-            class_weight="balanced", random_state=42, n_jobs=-1,
-        ),
-        "Extra Trees": ExtraTreesClassifier(
-            n_estimators=300, max_depth=8, min_samples_leaf=20,
-            class_weight="balanced", random_state=42, n_jobs=-1,
-        ),
-        "Gradient Boosted Trees (sklearn)": GradientBoostingClassifier(
-            n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42,
-        ),
-        "Hist Gradient Boosting": HistGradientBoostingClassifier(
-            max_depth=6, learning_rate=0.05, random_state=42,
-        ),
+    print("=" * 70 + "\n  Training the deployed model on all data\n" + "=" * 70)
+    t0 = time.time()
+    tr = a[a["net_ret"].notna()]
+    model = make_model().fit(tr[MODEL_FEATURES], tr["y"])
+    rs = pd.read_csv(MODEL_DIR / "recent_scores.csv")
+    th_now = float(np.quantile(rs["p"], q))
+    joblib.dump(model, MODEL_DIR / "model.pkl")
+    meta = {
+        "model_name": f"Bagged HistGradientBoosting x{N_BAG} swing-trade filter v2.1",
+        "model_version": 2,
+        "trained_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "data_through": str(a["date"].max().date()),
+        "trained_rows": int(len(tr)),
+        "symbols": sorted(a["symbol"].unique().tolist()),
+        "bot_symbols": FOCUS_SYMBOLS,
+        "feature_columns": MODEL_FEATURES,
+        "threshold_mode": "rolling_quantile", "window": WINDOW,
+        "threshold": round(th_now, 4),   # value right now; the bot re-computes it daily
+        "gate": strategy.GATE,
+        "strategy": {"tp_atr": TP_ATR, "sl_atr": SL_ATR, "max_hold": MAX_HOLD,
+                     "tp_min": strategy.TP_MIN, "tp_max": strategy.TP_MAX,
+                     "sl_min": strategy.SL_MIN, "sl_max": strategy.SL_MAX,
+                     "entry": "next session open", "cap_per_day": CAP_PER_DAY, "max_open": MAX_OPEN},
+        "position_value": POSITION_VALUE,
+        "round_trip_cost_pct": round(strategy.round_trip_cost(POSITION_VALUE) * 100, 3),
+        "target_win_rate": TARGET_WIN_RATE,
+        "data_source": "eod2 NSE bhavcopy history (GitHub) + Fyers History API top-ups",
+        **{k: v for k, v in meta_eval.items() if v is not None},
     }
-    if HAS_XGB:
-        baselines["XGBoost"] = RelabeledClassifier(XGBClassifier(
-            n_estimators=300, max_depth=5, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, random_state=42,
-            eval_metric="mlogloss", n_jobs=-1,
-        ))
-    if HAS_LGBM:
-        baselines["LightGBM"] = RelabeledClassifier(LGBMClassifier(
-            n_estimators=300, max_depth=6, learning_rate=0.05,
-            random_state=42, n_jobs=-1, verbosity=-1,
-        ))
-
-    for name, model in baselines.items():
-        model.fit(X_train, y_train)
-        evaluate(name, model, X_test, y_test, results)
-
-    print("\n" + "=" * 78)
-    print("STAGE 2: HYPERPARAMETER TUNING  (time-series cross-validation on train data)")
-    print("=" * 78)
-
-    rf_tuned = tune_with_time_series_cv(
-        "Random Forest",
-        RandomForestClassifier(class_weight="balanced", random_state=42, n_jobs=-1),
-        {
-            "n_estimators": [200, 300, 500],
-            "max_depth": [4, 6, 8, 10, None],
-            "min_samples_leaf": [5, 10, 20, 40],
-            "max_features": ["sqrt", "log2", 0.5],
-        },
-        X_train, y_train,
-    )
-    evaluate("Random Forest (tuned)", rf_tuned, X_test, y_test, results)
-
-    if HAS_XGB:
-        xgb_tuned = tune_with_time_series_cv(
-            "XGBoost",
-            XGBClassifier(random_state=42, eval_metric="mlogloss", n_jobs=-1),
-            {
-                "n_estimators": [200, 300, 500],
-                "max_depth": [3, 4, 5, 6],
-                "learning_rate": [0.01, 0.03, 0.05, 0.1],
-                "subsample": [0.6, 0.8, 1.0],
-                "colsample_bytree": [0.6, 0.8, 1.0],
-            },
-            X_train, pd.Series(y_train).map(LABEL_TO_CODE),
-        )
-        evaluate("XGBoost (tuned)", _wrap_fitted(xgb_tuned), X_test, y_test, results)
-    elif HAS_LGBM:
-        lgbm_tuned = tune_with_time_series_cv(
-            "LightGBM",
-            LGBMClassifier(random_state=42, n_jobs=-1, verbosity=-1),
-            {
-                "n_estimators": [200, 300, 500],
-                "max_depth": [3, 4, 6, 8],
-                "learning_rate": [0.01, 0.03, 0.05, 0.1],
-                "num_leaves": [15, 31, 63],
-            },
-            X_train, pd.Series(y_train).map(LABEL_TO_CODE),
-        )
-        evaluate("LightGBM (tuned)", _wrap_fitted(lgbm_tuned), X_test, y_test, results)
-
-    # --- Pick the overall winner by macro-F1 (fairer than raw accuracy when
-    # classes are imbalanced - see ML_WALKTHROUGH.md section 5) ---
-    print("\n" + "=" * 78)
-    print("FINAL COMPARISON")
-    print("=" * 78)
-    summary = pd.DataFrame({
-        name: {"accuracy": r["accuracy"], "f1_macro": r["f1_macro"]}
-        for name, r in results.items()
-    }).T.sort_values("f1_macro", ascending=False)
-    print(summary.to_string(float_format=lambda x: f"{x:.3f}"))
-
-    best_name = summary.index[0]
-    best = results[best_name]
-    best_model, best_preds, best_acc = best["model"], best["preds"], best["accuracy"]
-    print(f"\nSelected model for deployment: {best_name}  "
-          f"(test accuracy {best_acc:.3f}, macro-F1 {best['f1_macro']:.3f})")
-    print("(Random-chance baseline for 3 balanced classes would be ~0.33 accuracy.)")
-
-    # --- Bar chart comparing every model tried ---
-    fig, ax = plt.subplots(figsize=(8, 5))
-    summary_sorted = summary.sort_values("f1_macro")
-    ax.barh(summary_sorted.index, summary_sorted["f1_macro"], color="#4C72B0", label="macro-F1")
-    ax.axvline(0.33, color="gray", linestyle="--", linewidth=1, label="random-chance baseline")
-    ax.set_xlabel("macro-F1 on held-out test data")
-    ax.set_title("Model comparison")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(REPORT_DIR / "model_comparison.png", dpi=150)
-    plt.close(fig)
-
-    # --- Confusion matrix for the winner ---
-    cm = confusion_matrix(y_test, best_preds, labels=[-1, 0, 1])
-    fig, ax = plt.subplots(figsize=(5, 4.5))
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks([0, 1, 2]); ax.set_xticklabels(["SELL", "HOLD", "BUY"])
-    ax.set_yticks([0, 1, 2]); ax.set_yticklabels(["SELL", "HOLD", "BUY"])
-    ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
-    ax.set_title(f"{best_name}: Confusion Matrix")
-    for i in range(3):
-        for j in range(3):
-            ax.text(j, i, cm[i, j], ha="center", va="center",
-                     color="white" if cm[i, j] > cm.max() / 2 else "black")
-    fig.colorbar(im, ax=ax, shrink=0.8)
-    fig.tight_layout()
-    fig.savefig(REPORT_DIR / "confusion_matrix.png", dpi=150)
-    plt.close(fig)
-
-    # --- Feature importance for the winner (if it has one) ---
-    if hasattr(best_model, "feature_importances_"):
-        importances = pd.Series(best_model.feature_importances_, index=FEATURE_COLUMNS).sort_values()
-        fig, ax = plt.subplots(figsize=(6, 6))
-        importances.plot(kind="barh", ax=ax, color="#4C72B0")
-        ax.set_title(f"{best_name}: Feature Importance")
-        ax.set_xlabel("Relative importance")
-        fig.tight_layout()
-        fig.savefig(REPORT_DIR / "feature_importance.png", dpi=150)
-        plt.close(fig)
-
-    # --- Save the model + everything ml_signals.py needs to use it correctly ---
-    source_marker = DATA_DIR / ".source"
-    data_source = source_marker.read_text().strip() if source_marker.exists() else "unknown"
-
-    joblib.dump(best_model, MODEL_DIR / "model.pkl")
-    metadata = {
-        "model_name": best_name,
-        "feature_columns": FEATURE_COLUMNS,
-        "label_map": {"1": "BUY", "0": "HOLD", "-1": "SELL"},
-        "test_accuracy": round(float(best_acc), 4),
-        "test_f1_macro": round(float(best["f1_macro"]), 4),
-        "all_models_compared": summary.reset_index().rename(columns={"index": "model"}).to_dict("records"),
-        "trained_rows": len(train_df),
-        "symbols": sorted(df["symbol"].unique().tolist()),
-        "data_source": data_source,
-    }
-    with open(MODEL_DIR / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"\nSaved model -> models/model.pkl")
-    print(f"Saved plots -> reports/model_comparison.png, confusion_matrix.png, feature_importance.png")
-    if data_source.startswith("demo"):
-        print("\n*** This model was trained on SYNTHETIC demo data. It's for learning the")
-        print("*** pipeline only - do NOT use its live signals to trade real money.")
-        print("*** Run fetch_data_fyers.py (or fetch_data.py) for real data, then re-run this script.")
-    print("\nNext: python backtest.py")
-
-
-def _wrap_fitted(fitted_inner_model):
-    """RandomizedSearchCV already fit the inner model on 0..K-1 codes (we passed
-    it pre-mapped labels above) - this just wraps the already-fitted estimator
-    so its .predict()/.predict_proba() speak our -1/0/1 label language."""
-    wrapper = RelabeledClassifier.__new__(RelabeledClassifier)
-    wrapper.inner = fitted_inner_model
-    return wrapper
+    (MODEL_DIR / "metadata.json").write_text(json.dumps(meta, indent=2, default=str))
+    print(f"  saved models/model.pkl and models/metadata.json ({time.time()-t0:.0f}s)")
 
 
 if __name__ == "__main__":

@@ -870,7 +870,7 @@ function stopAll(){if(simIv){clearInterval(simIv);simIv=null;}if(liveIv){clearIn
 function startSim(){
   stopAll();mode='sim';
   const p=document.getElementById('statusPill');p.className='status-pill sim';p.querySelector('span').textContent='SIMULATION';
-  document.getElementById('modeText').textContent='Simulation mode';
+  document.getElementById('modeText').textContent='Random-walk demo (NOT the model) · real model replay: ATLAS → Bot → SIM';
   document.getElementById('btnSim').classList.add('active');document.getElementById('btnLive').classList.remove('active');
   simIv=setInterval(simTick,2000);simTick();
 }
@@ -890,7 +890,7 @@ async function liveFetch(){
     document.getElementById('sTotalOrds').textContent=d.total_orders||0;
   }catch(e){
     const p=document.getElementById('statusPill');p.className='status-pill offline';p.querySelector('span').textContent='BOT OFFLINE';
-    document.getElementById('modeText').textContent='Bot offline — simulation running';
+    document.getElementById('modeText').textContent='Bot offline — random-walk demo running (NOT the model)';
     if(mode==='live'){stopAll();startSim();}
   }
 }

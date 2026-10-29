@@ -1,229 +1,261 @@
 """
-features.py
-============
-ONE shared place for every indicator / feature calculation used by this project.
+features.py  (v2)
+=================
+ONE shared place for every indicator / feature calculation in this project.
 
-Why this file exists (read this if you're new to ML):
--------------------------------------------------------
-The single most common way to accidentally ruin a trading ML model is to compute
-a feature ONE way while training, and a SLIGHTLY DIFFERENT way when the bot is
-actually running live. The model then sees numbers at prediction time that don't
-look like anything it was trained on, and its predictions become garbage.
+train_model.py, backtest.py, ml_signals.py (the live bot) and the Atlas
+backend all import their indicator maths from THIS file, so a feature is
+computed exactly the same way in training and live (no train/serve skew).
 
-So both train_model.py (working on historical CSV data) and ml_signals.py
-(working on the bot's live in-memory price list) import their indicator math
-from THIS file. There is only one version of "what is RSI" in this whole project.
+What changed in v2 (October 2026)
+---------------------------------
+* Every model feature is now SCALE-FREE (percentages, ratios, 0-100
+  oscillators). v1 fed raw EMA / MACD rupee values to the model, which made
+  a ₹700 stock and a ₹3,000 stock look like different universes. Scale-free
+  features let ONE model learn from ~55 NSE stocks and 20 years of history
+  instead of 4 stocks x 5 years.
+* Added the indicators the Atlas front end shows on its Technicals tab:
+  SMA 20 / 50 / 200 and EMA 20 (as % distance from price), plus the
+  SMA50-vs-SMA200 "golden cross" gap and the slope of SMA 200.
+* Added short-term mean-reversion features (RSI-2, IBS, down-streak, 1-3 day
+  returns, distance from 5-day low, 20-day z-score, opening gap) - these are
+  what make short swing trades predictable.
+* Added market-regime features from NIFTY 50 and India VIX, and relative
+  strength of the stock vs the index.
 
-Two APIs are provided for every indicator:
-  - a VECTORIZED pandas version (operates on a whole DataFrame column at once) -
-    fast, used when we crunch years of historical data for training.
-  - a "latest value from a list" version - used live, when the bot only wants
-    the single most-recent indicator value from its running price/volume history.
-Both call the same underlying math, so they agree with each other.
+The label / exit rules for the swing strategy live in strategy.py.
 """
 
 import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Config: keep every "magic number" in one place so it's easy to tune later.
+# Periods (every "magic number" in one place)
 # ---------------------------------------------------------------------------
-EMA_FAST = 9
-EMA_SLOW = 21
+EMA_FAST, EMA_SLOW = 9, 21
 RSI_PERIOD = 14
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 BB_PERIOD, BB_STD = 20, 2
 STOCH_PERIOD = 14
-MOMENTUM_PERIODS = [5, 10, 20]  # % return over the last 5, 10, 20 bars
-VOLATILITY_PERIOD = 10          # rolling std-dev of daily returns
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 CCI_PERIOD = 20
 WILLIAMS_PERIOD = 14
 OBV_ROC_PERIOD = 10
-LOOKBACK_52W = 252               # ~1 trading year
-LOOKBACK_52W_MIN = 60            # degrade gracefully with less history than a full year
+LOOKBACK_52W = 252
+LOOKBACK_52W_MIN = 60
+SMA_PERIODS = (20, 50, 200)        # Atlas Technicals tab
+EMA_ATLAS = 20                     # Atlas Technicals tab
 
-# Labeling (how we decide what "correct" BUY/SELL/HOLD looks like in hindsight)
-LABEL_HORIZON = 5              # look this many bars into the future
-LABEL_THRESHOLD = 0.015        # +/-1.5% forward return splits BUY / SELL / HOLD
-
-FEATURE_COLUMNS = [
-    "ema9", "ema21", "ema_gap_pct",
-    "rsi",
-    "macd", "macd_signal", "macd_hist",
-    "bb_pct_b", "bb_width",
-    "vwap_gap_pct",
-    "stoch",
-    "mom_5", "mom_10", "mom_20",
-    "volatility_10",
-    "volume_ratio",
-    "atr_pct",
-    "adx",
-    "cci",
-    "williams_r",
-    "obv_roc",
-    "pct_from_52w_high",
-    "pct_from_52w_low",
+# ---------------------------------------------------------------------------
+# Model features (all scale-free). Order matters: the model is trained on it.
+# ---------------------------------------------------------------------------
+STOCK_FEATURES = [
+    # trend
+    "ema_gap_pct", "dist_ema20", "dist_sma20", "dist_sma50", "dist_sma200",
+    "sma50_200_gap", "sma200_slope",
+    # momentum / oscillators
+    "rsi", "rsi2", "rsi5", "macd_pct", "macd_hist_pct", "stoch", "williams_r",
+    "cci", "adx", "di_diff",
+    # returns
+    "mom_1", "mom_3", "mom_5", "mom_10", "mom_20", "mom_60",
+    # volatility / bands
+    "bb_pct_b", "bb_width", "atr_pct", "volatility_10", "vol_ratio_10_60",
+    # volume
+    "volume_ratio", "vwap_gap_pct", "obv_roc",
+    # price action (mean reversion)
+    "ibs", "gap_pct", "down_streak", "dist_low5", "dist_high5", "zscore_20",
+    # yearly range
+    "pct_from_52w_high", "pct_from_52w_low",
 ]
+MARKET_FEATURES = [
+    "mkt_mom_5", "mkt_mom_20", "mkt_dist_sma200", "mkt_rsi", "mkt_rsi2",
+    "vix", "vix_chg_5", "rel_str_20", "rel_str_60",
+]
+FEATURE_COLUMNS = STOCK_FEATURES + MARKET_FEATURES
+
+# Bars of daily history needed before every stock feature is defined
+# (SMA200 + its 20-day slope is the binding constraint).
+MIN_DAILY_HISTORY = 200 + 20 + 5
 
 
 # ---------------------------------------------------------------------------
-# Vectorized (pandas) versions - used on full historical DataFrames
+# helpers
+# ---------------------------------------------------------------------------
+def _rsi(close: pd.Series, n: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).fillna(50)
+
+
+def _true_range(df: pd.DataFrame) -> pd.Series:
+    pc = df["close"].shift(1)
+    return pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
+
+
+# ---------------------------------------------------------------------------
+# Stock indicators (vectorised, one symbol, sorted by date ascending)
 # ---------------------------------------------------------------------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    df must have columns: open, high, low, close, volume (lowercase), sorted
-    by date ascending, one row per bar, for a SINGLE symbol.
-    Returns a new DataFrame with indicator + feature columns appended.
-    """
+    """df needs open, high, low, close, volume (lowercase). Returns a copy with
+    raw indicator columns (for display) and the scale-free STOCK_FEATURES."""
     df = df.copy()
-    close = df["close"]
-    volume = df["volume"]
+    o, h, l, c, v = (df[k].astype(float) for k in ("open", "high", "low", "close", "volume"))
 
-    # --- Trend: EMAs ---
-    df["ema9"] = close.ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema21"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
-    df["ema_gap_pct"] = (df["ema9"] - df["ema21"]) / df["ema21"] * 100
-
-    # --- Momentum oscillator: RSI (Wilder's smoothing, the standard definition) ---
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    df["rsi"] = df["rsi"].fillna(50)  # neutral when undefined (e.g. no losses yet)
-
-    # --- MACD ---
-    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
-    df["macd"] = ema_fast - ema_slow
+    # --- raw indicators (also shown on the dashboard / Atlas Technicals tab)
+    df["ema9"] = c.ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema21"] = c.ewm(span=EMA_SLOW, adjust=False).mean()
+    df["ema20"] = c.ewm(span=EMA_ATLAS, adjust=False).mean()
+    for p in SMA_PERIODS:
+        df[f"sma{p}"] = c.rolling(p).mean()
+    ema_f = c.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_s = c.ewm(span=MACD_SLOW, adjust=False).mean()
+    df["macd"] = ema_f - ema_s
     df["macd_signal"] = df["macd"].ewm(span=MACD_SIGNAL, adjust=False).mean()
     df["macd_hist"] = df["macd"] - df["macd_signal"]
+    mid = c.rolling(BB_PERIOD).mean()
+    std = c.rolling(BB_PERIOD).std()
+    df["bb_mid"], df["bb_upper"], df["bb_lower"] = mid, mid + BB_STD * std, mid - BB_STD * std
+    vwap = (c * v).rolling(BB_PERIOD).sum() / v.rolling(BB_PERIOD).sum().replace(0, np.nan)
+    df["vwap"] = vwap
+    tr = _true_range(df)
+    atr = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
+    df["atr"] = atr
 
-    # --- Bollinger Bands ---
-    mid = close.rolling(BB_PERIOD).mean()
-    std = close.rolling(BB_PERIOD).std()
-    upper = mid + BB_STD * std
-    lower = mid - BB_STD * std
-    # %B: where is price within the band? 0 = at lower band, 1 = at upper band
-    df["bb_pct_b"] = (close - lower) / (upper - lower)
-    df["bb_width"] = (upper - lower) / mid
+    # --- trend features
+    df["ema_gap_pct"] = (df["ema9"] - df["ema21"]) / df["ema21"] * 100
+    df["dist_ema20"] = (c / df["ema20"] - 1) * 100
+    for p in SMA_PERIODS:
+        df[f"dist_sma{p}"] = (c / df[f"sma{p}"] - 1) * 100
+    df["sma50_200_gap"] = (df["sma50"] / df["sma200"] - 1) * 100
+    df["sma200_slope"] = df["sma200"].pct_change(20) * 100
 
-    # --- VWAP, as a rolling 20-day window rather than cumulative-since-day-1.
-    # (A cumulative-from-the-start VWAP drifts arbitrarily far from price over
-    # a multi-year dataset and its value would depend on how much history
-    # happens to be loaded - not a stable, comparable feature. A rolling
-    # window keeps it meaningful and consistent between training and live.) ---
-    rolling_pv = (close * volume).rolling(BB_PERIOD).sum()
-    rolling_v = volume.rolling(BB_PERIOD).sum().replace(0, np.nan)
-    vwap = rolling_pv / rolling_v
-    df["vwap_gap_pct"] = (close - vwap) / vwap * 100
-
-    # --- Stochastic Oscillator ---
-    low_min = df["low"].rolling(STOCH_PERIOD).min()
-    high_max = df["high"].rolling(STOCH_PERIOD).max()
-    df["stoch"] = (close - low_min) / (high_max - low_min).replace(0, np.nan) * 100
-    df["stoch"] = df["stoch"].fillna(50)
-
-    # --- Derived: momentum & volatility & volume ---
-    for p in MOMENTUM_PERIODS:
-        df[f"mom_{p}"] = close.pct_change(p) * 100
-    df["volatility_10"] = close.pct_change().rolling(VOLATILITY_PERIOD).std() * 100
-    df["volume_ratio"] = volume / volume.rolling(20).mean().replace(0, np.nan)
-
-    # --- ATR (Average True Range): how much a stock typically moves per day,
-    # in % of price so it's comparable across stocks of different price levels ---
-    prev_close = close.shift(1)
-    true_range = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr = true_range.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
-    df["atr_pct"] = atr / close * 100
-
-    # --- ADX (Average Directional Index): how STRONG the current trend is,
-    # regardless of direction. Low ADX = choppy/sideways, high ADX = trending. ---
-    up_move = df["high"].diff()
-    down_move = -df["low"].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    atr_for_di = true_range.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean().replace(0, np.nan)
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / ADX_PERIOD, adjust=False).mean() / atr_for_di
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / ADX_PERIOD, adjust=False).mean() / atr_for_di
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    # --- momentum / oscillators
+    df["rsi"] = _rsi(c, RSI_PERIOD)
+    df["rsi2"] = _rsi(c, 2)
+    df["rsi5"] = _rsi(c, 5)
+    df["macd_pct"] = df["macd"] / c * 100
+    df["macd_hist_pct"] = df["macd_hist"] / c * 100
+    lo14, hi14 = l.rolling(STOCH_PERIOD).min(), h.rolling(STOCH_PERIOD).max()
+    df["stoch"] = ((c - lo14) / (hi14 - lo14).replace(0, np.nan) * 100).fillna(50)
+    hh, ll = h.rolling(WILLIAMS_PERIOD).max(), l.rolling(WILLIAMS_PERIOD).min()
+    df["williams_r"] = (hh - c) / (hh - ll).replace(0, np.nan) * -100
+    tp = (h + l + c) / 3
+    md = tp.rolling(CCI_PERIOD).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    df["cci"] = (tp - tp.rolling(CCI_PERIOD).mean()) / (0.015 * md.replace(0, np.nan))
+    up, dn = h.diff(), -l.diff()
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    atr_di = tr.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean().replace(0, np.nan)
+    pdi = 100 * pdm.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean() / atr_di
+    mdi = 100 * mdm.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean() / atr_di
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
     df["adx"] = dx.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()
+    df["di_diff"] = pdi - mdi
 
-    # --- CCI (Commodity Channel Index): how far price is from its recent
-    # average, scaled by typical deviation - flags "stretched" moves ---
-    typical_price = (df["high"] + df["low"] + close) / 3
-    tp_sma = typical_price.rolling(CCI_PERIOD).mean()
-    mean_dev = typical_price.rolling(CCI_PERIOD).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-    df["cci"] = (typical_price - tp_sma) / (0.015 * mean_dev.replace(0, np.nan))
+    # --- returns
+    for p in (1, 3, 5, 10, 20, 60):
+        df[f"mom_{p}"] = c.pct_change(p) * 100
 
-    # --- Williams %R: similar idea to Stochastic, where price sits within
-    # its recent high/low range, on a -100..0 scale ---
-    hh = df["high"].rolling(WILLIAMS_PERIOD).max()
-    ll = df["low"].rolling(WILLIAMS_PERIOD).min()
-    df["williams_r"] = (hh - close) / (hh - ll).replace(0, np.nan) * -100
+    # --- volatility / bands
+    df["bb_pct_b"] = (c - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / mid * 100
+    df["atr_pct"] = atr / c * 100
+    r = c.pct_change()
+    df["volatility_10"] = r.rolling(10).std() * 100
+    df["vol_ratio_10_60"] = r.rolling(10).std() / r.rolling(60).std().replace(0, np.nan)
 
-    # --- OBV (On-Balance Volume): running total of volume, added when price
-    # rises and subtracted when it falls. We use its 10-day RATE OF CHANGE
-    # rather than the raw cumulative level, since the level's scale isn't
-    # comparable across stocks (or even meaningful on its own). ---
-    obv_direction = np.sign(close.diff().fillna(0))
-    obv = (obv_direction * volume).cumsum()
-    df["obv_roc"] = obv.pct_change(OBV_ROC_PERIOD).replace([np.inf, -np.inf], np.nan) * 100
+    # --- volume
+    df["volume_ratio"] = v / v.rolling(20).mean().replace(0, np.nan)
+    df["vwap_gap_pct"] = (c / vwap - 1) * 100
+    obv = (np.sign(c.diff().fillna(0)) * v).cumsum()
+    # OBV change over 10 days, normalised by 20-day average volume (the raw
+    # OBV level and its pct_change are both meaningless across stocks)
+    df["obv_roc"] = (obv - obv.shift(OBV_ROC_PERIOD)) / v.rolling(20).mean().replace(0, np.nan)
 
-    # --- Position relative to the 52-week range: is price near a breakout
-    # (near its 1yr high) or near capitulation (near its 1yr low)? ---
-    roll_max = close.rolling(LOOKBACK_52W, min_periods=LOOKBACK_52W_MIN).max()
-    roll_min = close.rolling(LOOKBACK_52W, min_periods=LOOKBACK_52W_MIN).min()
-    df["pct_from_52w_high"] = (close - roll_max) / roll_max * 100
-    df["pct_from_52w_low"] = (close - roll_min) / roll_min * 100
+    # --- price action (short-term mean reversion)
+    df["ibs"] = ((c - l) / (h - l).replace(0, np.nan)).fillna(0.5)
+    df["gap_pct"] = (o / c.shift(1) - 1) * 100
+    down = (c.diff() < 0).astype(int)
+    df["down_streak"] = down.groupby((down == 0).cumsum()).cumsum()
+    df["dist_low5"] = (c / l.rolling(5).min() - 1) * 100
+    df["dist_high5"] = (c / h.rolling(5).max() - 1) * 100
+    df["zscore_20"] = (c - mid) / std.replace(0, np.nan)
 
+    # --- yearly range
+    mx = c.rolling(LOOKBACK_52W, min_periods=LOOKBACK_52W_MIN).max()
+    mn = c.rolling(LOOKBACK_52W, min_periods=LOOKBACK_52W_MIN).min()
+    df["pct_from_52w_high"] = (c / mx - 1) * 100
+    df["pct_from_52w_low"] = (c / mn - 1) * 100
     return df
 
 
-def add_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds a 'label' column: 1 = BUY, -1 = SELL, 0 = HOLD, based on the forward
-    return LABEL_HORIZON bars ahead. This uses FUTURE data on purpose - it's
-    how we build a "ground truth" answer key to train against. These rows get
-    dropped before backtesting (a backtest must never see the future).
-    """
+# ---------------------------------------------------------------------------
+# Market regime (NIFTY 50 + India VIX), joined onto each stock by date
+# ---------------------------------------------------------------------------
+def market_frame(nifty: pd.DataFrame, vix: pd.DataFrame | None = None) -> pd.DataFrame:
+    """nifty/vix: DataFrames with date + close (vix optional). Returns one row
+    per date with the market features (except relative strength)."""
+    n = nifty.sort_values("date").set_index("date")["close"].astype(float)
+    m = pd.DataFrame(index=n.index)
+    m["mkt_close"] = n
+    m["mkt_mom_5"] = n.pct_change(5) * 100
+    m["mkt_mom_20"] = n.pct_change(20) * 100
+    m["mkt_mom_60"] = n.pct_change(60) * 100
+    m["mkt_dist_sma200"] = (n / n.rolling(200).mean() - 1) * 100
+    m["mkt_rsi"] = _rsi(n, 14)
+    m["mkt_rsi2"] = _rsi(n, 2)
+    if vix is not None and len(vix):
+        vx = vix.sort_values("date").set_index("date")["close"].astype(float)
+        vx = vx.reindex(m.index).ffill(limit=3)
+        m["vix"] = vx
+        m["vix_chg_5"] = vx.pct_change(5) * 100
+    else:
+        m["vix"] = np.nan
+        m["vix_chg_5"] = np.nan
+    return m.reset_index()
+
+
+def add_market(df: pd.DataFrame, mkt: pd.DataFrame) -> pd.DataFrame:
+    """Join market features (by date) onto a stock frame that already has
+    add_indicators() columns, and add relative strength vs the index."""
+    out = df.merge(mkt, on="date", how="left")
+    out["rel_str_20"] = out["mom_20"] - out["mkt_mom_20"]
+    out["rel_str_60"] = out["mom_60"] - out["mkt_mom_60"]
+    return out
+
+
+def build_features(df: pd.DataFrame, mkt: pd.DataFrame | None) -> pd.DataFrame:
+    """OHLCV for one symbol -> indicators + market features. If mkt is None
+    the market columns are NaN (the model handles missing values natively)."""
+    out = add_indicators(df)
+    if mkt is not None:
+        out = add_market(out, mkt)
+    else:
+        for col in MARKET_FEATURES:
+            out[col] = np.nan
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Cross-sectional features (v2.1): how a stock looks RELATIVE TO THE WHOLE
+# UNIVERSE on the same day, plus market breadth. Needs every stock's row for
+# a date, so it runs on the combined frame (training) or on the morning's
+# full scan (live bot).
+# ---------------------------------------------------------------------------
+CS_SOURCE = ["mom_5", "rsi2", "mom_20", "dist_sma200", "zscore_20", "volume_ratio", "atr_pct"]
+CROSS_FEATURES = [f"cs_{c}" for c in CS_SOURCE] + ["breadth_50", "breadth_down5"]
+MODEL_FEATURES = FEATURE_COLUMNS + CROSS_FEATURES
+
+
+def add_cross_section(df: pd.DataFrame) -> pd.DataFrame:
+    """df: many symbols, with STOCK_FEATURES and a `date` column."""
     df = df.copy()
-    fwd_return = df["close"].shift(-LABEL_HORIZON) / df["close"] - 1
-    df["fwd_return"] = fwd_return
-    df["label"] = 0
-    df.loc[fwd_return > LABEL_THRESHOLD, "label"] = 1
-    df.loc[fwd_return < -LABEL_THRESHOLD, "label"] = -1
+    g = df.groupby("date")
+    for c in CS_SOURCE:
+        df[f"cs_{c}"] = g[c].rank(pct=True)
+    df["breadth_50"] = (df["dist_sma50"] > 0).astype(float).groupby(df["date"]).transform("mean")
+    df["breadth_down5"] = (df["mom_5"] < 0).astype(float).groupby(df["date"]).transform("mean")
     return df
-
-
-def build_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """Full pipeline: raw OHLCV -> indicators -> labels -> clean rows only."""
-    df = add_indicators(df)
-    df = add_labels(df)
-    # Drop rows where indicators or labels couldn't be computed
-    # (start of series has no history; end of series has no future to label)
-    needed = FEATURE_COLUMNS + ["label"]
-    df = df.dropna(subset=needed).reset_index(drop=True)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Minimum bars of daily history needed before every indicator is computable.
-# Used by ml_signals.py, which builds a real daily-bar history for the live
-# bot (see that file for why: the model is trained on DAILY bars, not raw
-# intraday ticks, so live inference needs to feed it daily bars too).
-# ---------------------------------------------------------------------------
-# Note: pct_from_52w_high/low use min_periods=LOOKBACK_52W_MIN (60), so they
-# become available well before a full year of history - that's the binding
-# constraint here, not the full 252-day window.
-MIN_DAILY_HISTORY = max(EMA_SLOW, MACD_SLOW + MACD_SIGNAL, BB_PERIOD, STOCH_PERIOD,
-                         ATR_PERIOD, ADX_PERIOD * 2, CCI_PERIOD, WILLIAMS_PERIOD,
-                         OBV_ROC_PERIOD, LOOKBACK_52W_MIN, 20) + 5

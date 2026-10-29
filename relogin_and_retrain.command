@@ -1,33 +1,22 @@
 #!/bin/bash
+# Fresh login -> update data from Fyers -> FULL walk-forward retrain (20-40 min)
+# -> backtest report. Run this every month or two, after market hours.
 set -e
 cd "$(dirname "$0")"
-echo "=================================================================="
-echo "  Smart Signal - fresh Fyers login + fetch real data + retrain"
-echo "=================================================================="
-echo ""
 source venv/bin/activate
-echo "[1/4] Opening a FRESH Fyers login page (the old code expired)..."
-echo "      Log in normally. You'll land on a page that looks broken"
-echo "      (can't connect to 127.0.0.1) - that's expected and fine."
-echo "      Copy the ENTIRE address bar URL from that broken page."
+pip install -q -r requirements_ml.txt >/dev/null 2>&1
+echo "[1/4] Fyers login (copy the whole URL of the broken-looking page and paste it)"
 python auth.py | tee /tmp/fyers_auth_url.txt
 AUTH_URL=$(grep -o 'http[s]*://[^ ]*' /tmp/fyers_auth_url.txt | head -1)
-if [ -n "$AUTH_URL" ]; then
-  open "$AUTH_URL"
-fi
-echo ""
-echo "[2/4] Paste the WHOLE url from the broken page below and press Enter"
-echo "      (or just the auth_code= part - either works now):"
+[ -n "$AUTH_URL" ] && open "$AUTH_URL"
 python get_token.py
+echo "[2/4] Updating ~190 stocks' daily history..."
+python update_data.py --days 120
+echo "[3/4] Walk-forward retrain (this takes a while)..."
+python train_model.py 2>&1 | tee train_output.log
+echo "[4/4] Backtest report..."
+python backtest.py 2>&1 | tee backtest_output.log
 echo ""
-echo "[3/4] Fetching real historical data from your Fyers account..."
-python fetch_data_fyers.py
-echo ""
-echo "[4/4] Training the model on real data..."
-python train_model.py
-echo ""
-echo "=================================================================="
-echo "  Done. To run the bot: source venv/bin/activate && python bot.py"
-echo "=================================================================="
+echo "Done. Restart the bot (restart_clean.command) to load the new model."
 echo "Press Enter to close this window..."
 read

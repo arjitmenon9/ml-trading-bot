@@ -1,0 +1,75 @@
+{
+  "model_name": "Hist Gradient Boosting",
+  "feature_columns": [
+    "ema9",
+    "ema21",
+    "ema_gap_pct",
+    "rsi",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_pct_b",
+    "bb_width",
+    "vwap_gap_pct",
+    "stoch",
+    "mom_5",
+    "mom_10",
+    "mom_20",
+    "volatility_10",
+    "volume_ratio",
+    "atr_pct",
+    "adx",
+    "cci",
+    "williams_r",
+    "obv_roc",
+    "pct_from_52w_high",
+    "pct_from_52w_low"
+  ],
+  "label_map": {
+    "1": "BUY",
+    "0": "HOLD",
+    "-1": "SELL"
+  },
+  "test_accuracy": 0.3729,
+  "test_f1_macro": 0.3591,
+  "all_models_compared": [
+    {
+      "model": "Hist Gradient Boosting",
+      "accuracy": 0.3728813559322034,
+      "f1_macro": 0.35912629641864974
+    },
+    {
+      "model": "Random Forest",
+      "accuracy": 0.3485169491525424,
+      "f1_macro": 0.3401028622757671
+    },
+    {
+      "model": "Logistic Regression (baseline)",
+      "accuracy": 0.3379237288135593,
+      "f1_macro": 0.337612155371328
+    },
+    {
+      "model": "Random Forest (tuned)",
+      "accuracy": 0.3347457627118644,
+      "f1_macro": 0.3302464508436943
+    },
+    {
+      "model": "Extra Trees",
+      "accuracy": 0.3347457627118644,
+      "f1_macro": 0.3297818769887755
+    },
+    {
+      "model": "Gradient Boosted Trees (sklearn)",
+      "accuracy": 0.3453389830508475,
+      "f1_macro": 0.31899818926362794
+    }
+  ],
+  "trained_rows": 3776,
+  "symbols": [
+    "AUBANK",
+    "BAJAJFINSV",
+    "HDFCBANK",
+    "RELIANCE"
+  ],
+  "data_source": "real (Fyers History API)"
+}

@@ -1,10 +1,10 @@
 #!/bin/bash
+# Restart the bot WITHOUT a new Fyers login (today's token already saved).
+# Not needed after get_token.py any more: a running bot reloads new tokens itself.
 cd "$(dirname "$0")"
 source venv/bin/activate
-echo "=================================================================="
-echo "  Starting the bot (paper trading mode)"
-echo "  Dashboard: http://127.0.0.1:5000"
-echo "  Press Ctrl+C here (or close this window) to stop the bot."
-echo "=================================================================="
-echo ""
+pkill -9 -f "bot.py" 2>/dev/null
+sleep 2
+echo "Starting the bot + ATLAS website: http://127.0.0.1:5000"
+( sleep 4 && open "http://127.0.0.1:5000/#/bot" ) &
 python bot.py 2>&1 | tee bot_output.log

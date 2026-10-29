@@ -23,7 +23,6 @@ pip install --upgrade pip -q
 
 echo ""
 echo "[2/6] Installing packages (this can take a few minutes the first time)..."
-pip install -q fyers-apiv3 flask flask-cors
 pip install -q -r requirements_ml.txt
 
 echo ""
@@ -42,16 +41,15 @@ echo "[4/6] Paste the auth_code below and press Enter:"
 python get_token.py
 
 echo ""
-echo "[5/6] Fetching real historical data from your Fyers account..."
-python fetch_data_fyers.py || echo "  (fetch had trouble - see messages above; you can retry later with: python fetch_data_fyers.py)"
+echo "[5/6] Topping up ~190 stocks' daily history from your Fyers account..."
+python update_data.py || echo "  (update had trouble - see messages above; retry with: python update_data.py)"
 
 echo ""
-echo "[6/6] Training the model on real data..."
-python train_model.py || echo "  (training had trouble - see messages above; retry with: python train_model.py)"
+echo "[6/6] Model: a trained model ships in models/. Retrain any time with relogin_and_retrain.command."
 
 echo ""
 echo "=================================================================="
-echo "  Done. To run the bot: source venv/bin/activate && python bot.py"
+echo "  Done. Daily: double-click start_today.command"
 echo "=================================================================="
 echo "Press Enter to close this window..."
 read
