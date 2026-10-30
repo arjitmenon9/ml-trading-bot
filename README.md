@@ -28,7 +28,7 @@ ml-trading-bot/
 │   │   ├── auth.py           step 1 of the daily login
 │   │   └── get_token.py      step 2 of the daily login
 │   ├── ml/                   model
-│   │   ├── features.py       48 scale-free features
+│   │   ├── features.py       57 scale-free features
 │   │   ├── ensemble.py       bagged HistGradientBoosting
 │   │   ├── train_model.py    walk-forward training
 │   │   ├── backtest.py       out-of-sample report
@@ -52,7 +52,7 @@ ml-trading-bot/
 ├── data/                     daily OHLCV: history/ (191 stocks), index/ (NIFTY, VIX…)
 ├── models/                   trained model, metadata, out-of-sample trades
 ├── reports/                  backtest and walk-forward charts
-├── docs/                     walkthrough + project reports
+├── docs/                     project report (Group 17), walkthrough, technical docs
 ├── archive/v1_2026-10-23/    the original v1 bot, kept for reference
 ├── requirements.txt
 └── fyers_secrets.example.json
@@ -102,7 +102,7 @@ positions.
 checks: the SMA200 slope is positive, price is within 10% of its SMA200,
 India VIX is at or below 30, and ATR is under 4%.
 
-**Model.** 3× bagged HistGradientBoosting on 48 scale-free features: moving
+**Model.** 3× bagged HistGradientBoosting on 57 scale-free features: moving
 averages, mean reversion, NIFTY/VIX regime, cross-sectional ranks and market
 breadth. It was trained on real daily data for 191 NSE stocks from 2007 to
 Oct 2026. The buy threshold is the top 0.3% of the last 250 trading days'
