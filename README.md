@@ -33,7 +33,8 @@ ml-trading-bot/
 │   │   ├── train_model.py    walk-forward training
 │   │   ├── backtest.py       out-of-sample report
 │   │   ├── ml_signals.py     live scoring
-│   │   └── predict_trend.py  today's candidates from the command line
+│   │   ├── predict_trend.py  today's candidates from the command line
+│   │   └── v3/pipeline.py    research pipeline (GPU, see below)
 │   ├── data_pipeline/        market data
 │   │   ├── universe.py       stock universe + loaders
 │   │   ├── update_data.py    daily top-up (Fyers, falls back to GitHub)
@@ -125,6 +126,19 @@ Limitations, stated plainly:
   holdout isn't perfectly untouched.
 
 Full details are in [`docs/ML_WALKTHROUGH.md`](docs/ML_WALKTHROUGH.md).
+
+---
+
+## Research pipeline (v3, in progress)
+
+`src/ml/v3/pipeline.py` is a separate research pipeline; the live bot does not use it yet.
+It builds a point-in-time universe of the 500 most liquid NSE stocks, ranks them each day
+on their 10-day forward return, and compares an ensemble of XGBoost, a GRU on raw candles
+and a CNN on candlestick chart images, walk-forward and after costs. It needs a GPU:
+open `notebooks/train_v3_colab.ipynb` in Google Colab and choose Runtime > Run all.
+
+Known limitation: the price history comes from a dataset that drops stocks about a year
+after they are delisted, so results still carry survivorship bias.
 
 ---
 
